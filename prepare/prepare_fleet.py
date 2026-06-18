@@ -60,8 +60,6 @@ def prepare_fleet(day=DAY):
         }
 
         # 构建 idle 段
-        # 订单前的 idle（从上线到第一单）
-        # 这里简化：认为司机在第一单前 5 分钟上线
         pre_idle_start = max(first_start - 300, 0)
         idle_segments = []
 
@@ -75,16 +73,11 @@ def prepare_fleet(day=DAY):
         # 两单之间的 idle
         for k in range(len(times)):
             busy_end = times[k] + atas[k]
-
             if k < len(times) - 1:
                 next_start = times[k + 1]
                 gap = next_start - busy_end
-
-                # 间隔太长（> 1 小时）认为下线了
                 if gap > 3600:
                     continue
-
-                # 有 idle 段
                 if gap > 0:
                     loc = int(dests[k]) if pd.notna(dests[k]) else 0
                     idle_segments.append((busy_end, next_start, loc))
@@ -98,7 +91,6 @@ def prepare_fleet(day=DAY):
         for idle_start, idle_end, loc in idle_segments:
             w_start = int(idle_start // DISPATCH_INTERVAL)
             w_end = int(idle_end // DISPATCH_INTERVAL)
-
             for wid in range(max(w_start, 0), min(w_end + 1, n_windows)):
                 window_idle_drivers[wid][did] = loc
 
@@ -134,7 +126,22 @@ def prepare_fleet(day=DAY):
     av_ids = list(range(-1, -n_av - 1, -1))
 
     # ============================================================
-    # 3. 保存
+    # 3. 区域需求密度（独立加载 link_to_zone，避免依赖订单列）
+    # ============================================================
+    ltz_path = os.path.join(DISPATCH_DATA_DIR, "link_to_zone.pkl")
+    if os.path.exists(ltz_path):
+        link_to_zone = pd.read_pickle(ltz_path)
+        # 给 orders 临时添加 zone 列（不保存回文件）
+        orders_copy = pd.read_pickle(orders_path)
+        orders_copy["zone"] = orders_copy["origin_link"].map(link_to_zone).fillna(0).astype(int)
+        zone_demand = orders_copy.groupby("zone")["order_id"].count().to_dict()
+        print(f"[prepare_fleet] Zone demand computed: {len(zone_demand)} zones")
+    else:
+        print("[prepare_fleet] Warning: link_to_zone.pkl not found, zone_demand will be empty.")
+        zone_demand = {}
+
+    # ============================================================
+    # 4. 组装结果（一次性定义）
     # ============================================================
     result = {
         "hv_schedules": hv_schedules,
@@ -147,8 +154,12 @@ def prepare_fleet(day=DAY):
             "avg_idle_per_window": float(np.mean(idle_counts)),
             "peak_idle": float(peak_idle),
         },
+        "zone_demand": zone_demand,   # ★ 关键字段
     }
 
+    # ============================================================
+    # 5. 保存
+    # ============================================================
     fleet_path = os.path.join(DISPATCH_DATA_DIR, f"fleet_schedule_day{day}.pkl")
     pd.to_pickle(result, fleet_path)
     print(f"  Saved: {fleet_path}")
@@ -162,6 +173,10 @@ def prepare_fleet(day=DAY):
 
     print(f"  HV: {len(hv_schedules):,} | AV: {n_av:,}")
     print(f"  Peak idle HV: {peak_idle:.0f}")
+    if zone_demand:
+        print(f"  Zone demand: {len(zone_demand)} zones with positive orders")
+    else:
+        print("  Zone demand: (empty)")
 
     return result
 

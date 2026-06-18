@@ -169,3 +169,96 @@ def full_analysis(results_dir=RESULTS_DIR):
     compare_strategies(results_dir)
     grade_distribution_analysis(results_dir)
     temporal_summary(results_dir)
+    zone_analysis(results_dir)
+    # ★ 可选：AV 比例对比（若存在多 AV 比例结果）
+    compare_av_ratios(results_dir)
+
+
+def zone_analysis(results_dir=RESULTS_DIR, grid_cols=10):
+    """
+    区域级别分析：计算每个 Zone 的多维指标，并分配网格坐标。
+    输出 CSV 供可视化使用。
+    """
+    order_logs = load_all_order_logs(results_dir)
+    if not order_logs:
+        print("[zone_analysis] No order logs found.")
+        return None
+
+    all_zone_stats = []
+    for name, df in order_logs.items():
+        if 'zone' not in df.columns:
+            continue
+        matched = df[df["matched"]]
+        if len(matched) == 0:
+            continue
+
+        grouped = matched.groupby("zone").agg(
+            total_orders=("order_id", "count"),
+            av_assigned=("vehicle_type", lambda x: (x == "AV").sum()),
+            hv_assigned=("vehicle_type", lambda x: (x == "HV").sum()),
+            avg_pickup=("pickup_time", "mean"),
+            avg_total_cost=("total_cost", "mean"),
+            avg_grade=("grade_num", "mean"),
+            avg_difficulty=("difficulty", "mean"),
+            avg_risk=("pred_risk_prob", "mean"),
+            match_rate=("matched", "mean"),  # 该区域匹配率
+        ).reset_index()
+
+        grouped["av_ratio"] = grouped["av_assigned"] / grouped["total_orders"]
+        grouped["strategy"] = name
+        all_zone_stats.append(grouped)
+
+    if not all_zone_stats:
+        return None
+
+    combined = pd.concat(all_zone_stats, ignore_index=True)
+
+    # 为每个 Zone 分配网格坐标（基于 zone_id 排序后均匀分布）
+    unique_zones = sorted(combined["zone"].unique())
+    n_zones = len(unique_zones)
+    n_cols = grid_cols
+    n_rows = (n_zones + n_cols - 1) // n_cols
+    zone_to_coord = {}
+    for i, z in enumerate(unique_zones):
+        row = i // n_cols
+        col = i % n_cols
+        zone_to_coord[z] = (col, row)  # x=col, y=row
+
+    # 添加坐标列
+    combined["x"] = combined["zone"].map(lambda z: zone_to_coord[z][0])
+    combined["y"] = combined["zone"].map(lambda z: zone_to_coord[z][1])
+
+    out_path = os.path.join(results_dir, "zone_stats.csv")
+    combined.to_csv(out_path, index=False)
+    print(f"[zone_analysis] Saved to {out_path}")
+    return combined
+
+
+
+def compare_av_ratios(results_dir=RESULTS_DIR):
+    """
+    对比不同 AV 比例（0%, 10%, 20%）的实验结果。
+    要求结果文件命名包含 _AV0, _AV10, _AV20 后缀。
+    """
+    summaries = load_all_summaries(results_dir)
+    rows = []
+    for name, s in summaries.items():
+        if "AV" not in name:
+            continue
+        # 解析 AV 比例
+        try:
+            av_pct = int(name.split("AV")[-1])
+        except:
+            av_pct = -1
+        rows.append({
+            "strategy": name,
+            "av_pct": av_pct,
+            "match_rate": s.get("match_rate", 0),
+            "avg_pickup": s.get("avg_pickup_time", 0),
+            "av_utilization": s.get("av_utilization", 0),
+            "av_order_share": s.get("av_order_share", 0),
+        })
+    df = pd.DataFrame(rows)
+    df.to_csv(os.path.join(results_dir, "av_ratio_comparison.csv"), index=False)
+    print("[compare_av_ratios] Saved comparison.")
+    return df

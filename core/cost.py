@@ -10,7 +10,7 @@ import numpy as np
 from core.config import (
     DEFAULT_PICKUP_TIME, BIG_M,
     ALPHA_DIFFICULTY, BETA_RISK, GAMMA_UNCERTAINTY,
-    TAU_SAFE_Q3,
+    TAU_SAFE_Q3,AV_COST_DISCOUNT, AV_COST_ADVANTAGE_ENABLED
 )
 
 
@@ -77,61 +77,52 @@ def compute_cost_matrix(orders: list, vehicles: list,
     cost : np.ndarray (n_orders, n_vehicles)
     pickup_times : np.ndarray (n_orders, n_vehicles)
     """
-    n_orders = len(orders)
-    n_vehicles = len(vehicles)
-
-    cost = np.full((n_orders, n_vehicles), BIG_M, dtype=np.float64)
-    pickup_times = np.full((n_orders, n_vehicles), DEFAULT_PICKUP_TIME, dtype=np.float64)
+    n_o, n_v = len(orders), len(vehicles)
+    cost_mat = np.full((n_o, n_v), BIG_M, dtype=np.float64)
+    pickup_mat = np.full((n_o, n_v), BIG_M, dtype=np.float64)  # 实际接驾时间（记录用）
 
     for i, order in enumerate(orders):
-        o_link = order.get("origin_link")
-        grade = order.get("grade_num", 2)
-        difficulty = float(order.get("difficulty", 0.0))
-        cong_prob = float(order.get("pred_cong_prob", 0.05))
-        risk_prob = float(order.get("pred_risk_prob", 0.01))
-        entropy = float(order.get("pred_entropy", 0.5))
-        eta = float(order.get("simple_eta", 300))
-
+        o_link = int(order.get("origin_link", 0))
         for j, vehicle in enumerate(vehicles):
-            # ---- 不可行检查 ----
-            if vehicle.is_av():
-                if grade == 4:
-                    continue
-                if risk_prob > TAU_SAFE_Q3:
-                    continue
-
-            # ---- 接驾时间 ----
-            v_link = vehicle.location_link
-            remaining = 0.0
-
+            # 1. 计算车辆状态带来的硬约束（剩余服务时间）
+            remaining_time = 0.0
             if vehicle.status == "NEAR_FREE":
-                # ★ 修复：用释放位置 + 加上剩余完成时间
-                v_link = vehicle.release_link
-                remaining = max(vehicle.busy_until - current_time, 0.0)
+                remaining_time = max(0.0, vehicle.busy_until - current_time)
+            elif vehicle.status == "BUSY":
+                # 理论上 BUSY 不会进入可用池，但做防御
+                remaining_time = max(0.0, vehicle.busy_until - current_time)
 
-            pt = estimate_pickup_time(v_link, o_link, link_distances, remaining)
-            pickup_times[i, j] = pt
+            # 2. 计算空驶接驾时间（纯距离成本）
+            v_link = int(vehicle.release_link if vehicle.status in ("NEAR_FREE", "BUSY") else vehicle.location_link)
+            travel_time = DEFAULT_PICKUP_TIME  # 默认值
 
-            # ---- 成本计算 ----
-            if vehicle.is_av():
-                if grade <= 2:
-                    # ★ G1/G2: AV 有 10% 效率优势
-                    av_bonus = -0.10 * eta
-                else:
-                    av_bonus = 0.0
-
-                av_penalty = (
-                    ALPHA_DIFFICULTY * difficulty * cong_prob
-                    + BETA_RISK * risk_prob * (1.0 + entropy)
-                    + GAMMA_UNCERTAINTY * entropy
-                ) * eta
-
-                cost[i, j] = pt + av_penalty + av_bonus
+            if v_link == o_link:
+                travel_time = 10.0  # 同一 link 最小接驾时间
             else:
-                # HV: 纯接驾时间
-                cost[i, j] = pt
+                # 双向查表
+                if v_link in link_distances and o_link in link_distances[v_link]:
+                    travel_time = float(link_distances[v_link][o_link])
+                elif o_link in link_distances and v_link in link_distances[o_link]:
+                    travel_time = float(link_distances[o_link][v_link])
+                else:
+                    travel_time = DEFAULT_PICKUP_TIME  # 保底
 
-    return cost, pickup_times
+            # 3. ★★★ 核心修复：AV 空驶时间享受边际成本折扣 ★★★
+            if AV_COST_ADVANTAGE_ENABLED and vehicle.is_av():
+                # 仅对空驶部分打折，剩余时间（乘客在车上）必须原价，否则会破坏时空连续性
+                discounted_travel = travel_time * AV_COST_DISCOUNT
+                total_cost = discounted_travel + remaining_time
+            else:
+                total_cost = travel_time + remaining_time
+
+            # 实际物理接驾时间（用于记录和用户体验统计）
+            actual_pickup = travel_time + remaining_time
+
+            # 写入矩阵
+            cost_mat[i, j] = total_cost
+            pickup_mat[i, j] = actual_pickup
+
+    return cost_mat, pickup_mat
 
 
 def filter_infeasible(cost_matrix: np.ndarray) -> np.ndarray:

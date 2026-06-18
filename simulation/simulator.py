@@ -13,7 +13,7 @@ from collections import defaultdict
 from core.config import (
     DISPATCH_INTERVAL, SECONDS_PER_DAY,
     MAX_CANDIDATE_ZONES, MAX_CANDIDATES_PER_ZONE,
-    TAU_SAFE_Q3, BIG_M, DEFAULT_PICKUP_TIME,
+    TAU_SAFE_Q3, BIG_M, DEFAULT_PICKUP_TIME,RELOCATION_ENABLED
 )
 from core.fleet import FleetManager
 from core.cost import compute_cost_matrix
@@ -53,7 +53,10 @@ class DispatchSimulator:
               f"{self.total_windows} windows ({self.interval}s)")
 
     def run(self, dispatcher, verbose=True):
-        recorder = DispatchRecorder()
+        recorder = DispatchRecorder(
+            total_av_vehicles=self.fleet.total_av,
+            total_simulation_seconds=self.total_windows * self.interval
+        )
         strategy_name = getattr(dispatcher, "name", "unknown")
 
         if verbose:
@@ -72,6 +75,11 @@ class DispatchSimulator:
 
             # ★ 把当前窗口订单数传给 fleet，用于供需比校准
             self.fleet.update(current_time, n_orders_this_window=n_orders)
+            # ★ 优先级2：空闲车辆主动巡游（向热区步进）
+            self._relocate_idle_vehicles(current_time, window_orders)
+
+            # 获取可用车辆（IDLE + NEAR_FREE）
+            
             available = self.fleet.get_available(current_time)
             fleet_stats = self.fleet.get_stats(current_time)
 
@@ -160,6 +168,7 @@ class DispatchSimulator:
                     vehicle_id=vehicle.id, vehicle_type=vehicle.vtype,
                     pickup_time=pt, total_cost=total_cost,
                     cross_zone=is_cross,
+                    zone=order.get("zone", 0)  # ★ 新增
                 )
 
             for oi in all_unmatched_indices:
@@ -172,6 +181,7 @@ class DispatchSimulator:
                         difficulty=order.get("difficulty", 0.0),
                         pred_risk_prob=order.get("pred_risk_prob", 0.0),
                         matched=False,
+                        zone=order.get("zone", 0)  # ★ 新增
                     )
 
             avg_pt = float(np.mean(pickup_times_list)) if pickup_times_list else 0.0
@@ -315,3 +325,69 @@ class DispatchSimulator:
                 all_unmatched.append(gi)
 
         return all_matched, all_unmatched
+
+    def _relocate_idle_vehicles(self, current_time: float, window_orders: list):
+        """
+        空闲车辆主动巡游：向需求热点步进移动，解决空间僵死问题。
+        AV 优先向 G1/G2 订单区移动，HV 向所有未匹配订单区移动。
+        """
+        from core.config import RELOCATION_ENABLED
+        if not RELOCATION_ENABLED or len(window_orders) == 0:
+            return
+
+        # 1. 统计当前窗口的需求分布（按 zone 聚合）
+        zone_demand = defaultdict(int)
+        zone_g12_demand = defaultdict(int)
+        for order in window_orders:
+            z = int(order.get("zone", 0))
+            grade = order.get("grade_num", 2)
+            zone_demand[z] += 1
+            if grade <= 2:  # G1 或 G2
+                zone_g12_demand[z] += 1
+
+        if not zone_demand:
+            return
+
+        # 找 Top-3 热区
+        top_hot_zones = [z for z, _ in sorted(zone_demand.items(), key=lambda x: -x[1])[:3]]
+        top_g12_zones = [z for z, _ in sorted(zone_g12_demand.items(), key=lambda x: -x[1])[:3]]
+
+        # 构建 zone -> link 缓存（避免重复构造）
+        if not hasattr(self, '_zone_to_link_cache'):
+            self._zone_to_link_cache = {}
+            for link, z in self.link_to_zone.items():
+                self._zone_to_link_cache.setdefault(z, []).append(link)
+
+        def _move_vehicle_towards(v, target_zones):
+            if not target_zones:
+                return
+            current_z = v.zone
+            if current_z in target_zones:
+                return
+            neighbors = self.zone_neighbors.get(current_z, [])
+            if not neighbors:
+                return
+            # 贪心：选择邻居中第一个属于热区的，否则随机选一个
+            best_next_z = None
+            for nz in neighbors:
+                if nz in target_zones:
+                    best_next_z = nz
+                    break
+            if best_next_z is None:
+                best_next_z = neighbors[0]
+
+            zone_links = self._zone_to_link_cache.get(best_next_z, [])
+            if zone_links:
+                new_link = zone_links[0]
+                v.location_link = new_link
+                v.zone = best_next_z
+
+        # AV 向 G1/G2 热点移动
+        for vehicle in self.fleet.vehicles.values():
+            if vehicle.status == "IDLE" and vehicle.is_av():
+                _move_vehicle_towards(vehicle, top_g12_zones)
+
+        # HV 向全局热点移动
+        for vehicle in self.fleet.vehicles.values():
+            if vehicle.status == "IDLE" and not vehicle.is_av():
+                _move_vehicle_towards(vehicle, top_hot_zones)

@@ -28,7 +28,8 @@ from core.baselines import (
 from simulation.simulator import DispatchSimulator
 from evaluation.analysis import full_analysis
 from evaluation.visualize import plot_all
-
+# 在文件顶部导入 config
+from core import config
 
 def create_simulator(day=DAY):
     orders = load_orders(day)
@@ -100,6 +101,27 @@ def run_all_strategies(day=DAY):
     print("=" * 60)
 
 
+def run_av_ratio_experiment(day=DAY, av_ratios=[0.0, 0.1, 0.2]):
+    original_ratio = config.AV_RATIO
+    try:
+        for ratio in av_ratios:
+            print(f"\n{'=' * 60}")
+            print(f"EXPERIMENT: AV_RATIO = {ratio:.0%}")
+            print(f"{'=' * 60}")
+
+            config.AV_RATIO = ratio
+            print(f"[DEBUG] config.AV_RATIO is now {config.AV_RATIO}")  # 确认修改
+
+            dispatchers = get_all_dispatchers()
+            for name, dispatcher in dispatchers.items():
+                simulator, _, _ = create_simulator(day)
+                print(f"\n--- Running: {name} (AV={int(ratio * 100)}%) ---")
+                recorder = simulator.run(dispatcher, verbose=True)
+                recorder.save(f"{name}_AV{int(ratio * 100)}")
+    finally:
+        config.AV_RATIO = original_ratio
+        print(f"\nRestored AV_RATIO to {original_ratio}")
+
 def main():
     parser = argparse.ArgumentParser(description="Stage 4: Dynamic Dispatch Simulation")
     parser.add_argument("--day", default=DAY, help="Day to simulate")
@@ -109,6 +131,8 @@ def main():
                         help="Only run analysis (no simulation)")
     parser.add_argument("--plot", action="store_true",
                         help="Only generate plots (no simulation)")
+    parser.add_argument("--av_scan", action="store_true", help="Run AV ratio scan (0%, 10%, 20%)")
+
     args = parser.parse_args()
 
     if args.analyze:
@@ -116,6 +140,12 @@ def main():
         return
 
     if args.plot:
+        plot_all()
+        return
+    if args.av_scan:
+        run_av_ratio_experiment(args.day)
+        # 扫描完成后自动生成分析和图表
+        full_analysis()
         plot_all()
         return
 
